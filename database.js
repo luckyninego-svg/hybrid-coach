@@ -8,10 +8,14 @@ const { createClient } = require('@supabase/supabase-js');
 let supabase;
 
 function init() {
-  supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_KEY
-  );
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  console.log('SUPABASE_URL:', url ? 'found (' + url.substring(0, 30) + '...)' : 'MISSING');
+  console.log('SUPABASE_SERVICE_KEY:', key ? 'found (length ' + key.length + ')' : 'MISSING');
+  if (!url || !key) {
+    throw new Error('Missing Supabase credentials. Check SUPABASE_URL and SUPABASE_SERVICE_KEY in Railway variables.');
+  }
+  supabase = createClient(url, key);
   console.log('Supabase connected');
 }
 
