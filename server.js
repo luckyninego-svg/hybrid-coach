@@ -18,48 +18,79 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = 'https://api.telegram.org/bot' + TELEGRAM_TOKEN;
 
+// ─────────────────────────────────────────────
+// SEND PLAIN MESSAGE
+// ─────────────────────────────────────────────
 async function sendTelegram(chatId, text) {
   try {
-    const cleanText = text.replace(/[*_`]/g, '');
     await axios.post(TELEGRAM_API + '/sendMessage', {
       chat_id: chatId,
-      text: cleanText
+      text: text.replace(/[*_`]/g, '')
     });
   } catch (err) {
-    console.error('Telegram send error:', err.message);
-    console.error('Details:', err.response && err.response.data);
+    console.error('Telegram send error:', err.message, err.response && err.response.data);
   }
 }
 
+// ─────────────────────────────────────────────
+// SEND MESSAGE WITH INLINE BUTTONS
+// ─────────────────────────────────────────────
+async function sendTelegramButtons(chatId, text, buttons) {
+  try {
+    await axios.post(TELEGRAM_API + '/sendMessage', {
+      chat_id: chatId,
+      text: text.replace(/[*_`]/g, ''),
+      reply_markup: { inline_keyboard: buttons }
+    });
+  } catch (err) {
+    console.error('Telegram button error:', err.message, err.response && err.response.data);
+  }
+}
+
+// ─────────────────────────────────────────────
+// RPE BUTTONS (1-10 in two rows)
+// ─────────────────────────────────────────────
+function rpeButtons(activityId) {
+  return [
+    [1,2,3,4,5].map(function(n) { return { text: String(n), callback_data: 'rpe_' + n + '_' + activityId }; }),
+    [6,7,8,9,10].map(function(n) { return { text: String(n), callback_data: 'rpe_' + n + '_' + activityId }; })
+  ];
+}
+
+// ─────────────────────────────────────────────
+// TELEGRAM: Receive messages
+// ─────────────────────────────────────────────
 app.post('/webhook/telegram', async (req, res) => {
   res.sendStatus(200);
+
+  // Handle button callbacks (RPE taps)
+  if (req.body && req.body.callback_query) {
+    await handleCallback(req.body.callback_query);
+    return;
+  }
+
   const message = req.body && req.body.message;
   if (!message) return;
+
   const chatId = message.chat.id;
   const text = message.text && message.text.trim();
   const firstName = (message.from && message.from.first_name) || 'Athlete';
   if (!text) return;
 
+  // /start
   if (text === '/start') {
     await db.upsertAthlete({ telegram_id: String(chatId), name: firstName });
-    const stravaAuthUrl = process.env.BASE_URL + '/auth/strava?telegram_id=' + chatId;
-    // Use inline button so Telegram preserves the full URL including state param
-    try {
-      await axios.post(TELEGRAM_API + '/sendMessage', {
-        chat_id: chatId,
-        text: 'Welcome ' + firstName + '!\n\nI am your personal Running & HYROX coach, powered by science.\n\nTap the button below to connect your Strava:',
-        reply_markup: {
-          inline_keyboard: [[
-            { text: 'Connect Strava', url: stravaAuthUrl }
-          ]]
-        }
-      });
-    } catch (err) {
-      console.error('Start message error:', err.message);
-    }
+    await sendTelegramButtons(chatId,
+      'Welcome ' + firstName + '!\n\n' +
+      'I am your personal Running & HYROX coach, powered by science.\n\n' +
+      'I analyze your training data and build your zones from real physiology - not generic formulas.\n\n' +
+      'Step 1: Connect your Strava:',
+      [[{ text: 'Connect Strava', url: process.env.BASE_URL + '/auth/strava?telegram_id=' + chatId }]]
+    );
     return;
   }
 
+  // /status
   if (text === '/status') {
     const athlete = await db.getAthleteByTelegram(chatId);
     if (!athlete) {
@@ -69,17 +100,21 @@ app.post('/webhook/telegram', async (req, res) => {
     await sendTelegram(chatId,
       'Your Profile\n\n' +
       'Name: ' + (athlete.name || 'Unknown') + '\n' +
+      'Age: ' + (athlete.age ? athlete.age + ' years' : 'Not set') + '\n' +
+      'Max HR: ' + (athlete.max_hr_calculated ? athlete.max_hr_calculated + ' bpm' : 'Not calculated') + '\n' +
       'Strava: ' + (athlete.strava_connected ? 'Connected' : 'Not connected') + '\n' +
       'Critical Speed: ' + (athlete.critical_speed ? athlete.critical_speed + ' min/km' : 'Not set') + '\n' +
       'LT1: ' + (athlete.lt1_pace ? athlete.lt1_pace + ' min/km at ' + athlete.lt1_hr + ' bpm' : 'Not set') + '\n' +
       'LT2: ' + (athlete.lt2_pace ? athlete.lt2_pace + ' min/km at ' + athlete.lt2_hr + ' bpm' : 'Not set') + '\n' +
+      'Zone calibration: ' + (athlete.rpe_count ? athlete.rpe_count + ' sessions logged' : 'Not started') + '\n' +
       'Training Phase: ' + (athlete.training_phase || 'Base') + '\n\n' +
-      '/setzones - calculate zones from your Strava data\n' +
+      '/setzones - calculate zones from Strava data\n' +
       '/disconnect - disconnect Strava'
     );
     return;
   }
 
+  // /disconnect
   if (text === '/disconnect') {
     await db.updateAthlete(String(chatId), {
       strava_connected: 0,
@@ -95,47 +130,46 @@ app.post('/webhook/telegram', async (req, res) => {
     return;
   }
 
+  // /setzones
   if (text.startsWith('/setzones')) {
     const athleteForZones = await db.getAthleteByTelegram(chatId);
     if (!athleteForZones || !athleteForZones.strava_connected) {
       await sendTelegram(chatId, 'Please connect Strava first. Send /start to get the connect link.');
       return;
     }
-    await sendTelegram(chatId, 'Analyzing your last 60 days of Strava runs to find your LT1 and LT2. Give me a moment...');
-    try {
-      const zones = await calculateZonesFromStrava(athleteForZones);
-      if (!zones) {
-        await sendTelegram(chatId, 'I need at least 5 runs with heart rate data in the last 60 days. Keep training and try again soon!');
-        return;
-      }
-      await db.updateAthlete(String(chatId), {
-        critical_speed: zones.criticalSpeed,
-        zone1_pace: zones.z1,
-        zone2_pace: zones.z2,
-        zone3_pace: zones.z3,
-        zone4_pace: zones.z4,
-        zone5_pace: zones.z5,
-        lt1_pace: zones.lt1,
-        lt2_pace: zones.lt2,
-        lt1_hr: String(zones.lt1Hr),
-        lt2_hr: String(zones.lt2Hr),
-        awaiting_input: null
-      });
-      await sendTelegram(chatId,
-        'Zones calculated from your Strava data (' + zones.runsAnalyzed + ' runs analyzed)\n\n' +
-        'LT1 aerobic threshold: ' + zones.lt1 + ' min/km at ' + zones.lt1Hr + ' bpm\n' +
-        'LT2 anaerobic threshold: ' + zones.lt2 + ' min/km at ' + zones.lt2Hr + ' bpm\n\n' +
-        'Z1 Recovery:     slower than ' + zones.z1 + ' min/km\n' +
-        'Z2 Aerobic Base: ' + zones.z2 + ' min/km\n' +
-        'Z3 Tempo:        ' + zones.z3 + ' min/km\n' +
-        'Z4 Threshold:    ' + zones.z4 + ' min/km\n' +
-        'Z5 VO2max+:      faster than ' + zones.z5 + ' min/km\n\n' +
-        'Use /setzones anytime to recalculate as your fitness improves.'
-      );
-    } catch (err) {
-      console.error('Zone calculation error:', err.message);
-      await sendTelegram(chatId, 'Something went wrong analyzing your Strava data. Try again in a moment.');
+    if (!athleteForZones.age) {
+      await sendTelegram(chatId, 'I need your age first to calculate your max heart rate.\n\nHow old are you? (just type the number)');
+      await db.updateAthlete(String(chatId), { awaiting_input: 'age' });
+      return;
     }
+    await runZoneCalculation(chatId, athleteForZones);
+    return;
+  }
+
+  // Handle awaiting input flows
+  const athlete = await db.getAthleteByTelegram(chatId);
+
+  if (athlete && athlete.awaiting_input === 'age') {
+    var age = parseInt(text);
+    if (isNaN(age) || age < 10 || age > 90) {
+      await sendTelegram(chatId, 'Please enter a valid age as a number, e.g. 32');
+      return;
+    }
+    // Tanaka formula: HRmax = 208 - (0.7 x age)
+    var tanakaMax = Math.round(208 - (0.7 * age));
+    await db.updateAthlete(String(chatId), {
+      age: age,
+      max_hr_calculated: tanakaMax,
+      awaiting_input: null
+    });
+    await sendTelegram(chatId,
+      'Got it! Age: ' + age + '\n\n' +
+      'Estimated max HR (Tanaka formula): ' + tanakaMax + ' bpm\n\n' +
+      'I will cross-check this against your actual Strava data and use whichever is higher.\n\n' +
+      'Calculating your zones now...'
+    );
+    var updatedAthlete = await db.getAthleteByTelegram(chatId);
+    await runZoneCalculation(chatId, updatedAthlete);
     return;
   }
 
@@ -157,13 +191,167 @@ app.post('/webhook/telegram', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// HANDLE RPE BUTTON CALLBACKS
+// ─────────────────────────────────────────────
+async function handleCallback(callbackQuery) {
+  var chatId = callbackQuery.message.chat.id;
+  var data = callbackQuery.data;
+
+  // Answer the callback to remove loading spinner
+  try {
+    await axios.post(TELEGRAM_API + '/answerCallbackQuery', {
+      callback_query_id: callbackQuery.id
+    });
+  } catch (err) { /* ignore */ }
+
+  if (data.startsWith('rpe_')) {
+    var parts = data.split('_');
+    var rpe = parseInt(parts[1]);
+    var activityId = parts[2];
+
+    // Save RPE to activity
+    await db.saveRPE(activityId, rpe);
+
+    // Get athlete and adjust zones based on RPE
+    var athlete = await db.getAthleteByTelegram(chatId);
+    var adjustment = await adjustZonesFromRPE(athlete, rpe, activityId);
+
+    var feedback = getRPEFeedback(rpe, adjustment);
+    await sendTelegram(chatId, 'RPE ' + rpe + '/10 logged.\n\n' + feedback);
+
+    // After 3+ RPE logs, recalibrate zones
+    var rpeCount = (athlete.rpe_count || 0) + 1;
+    await db.updateAthlete(String(chatId), { rpe_count: rpeCount });
+
+    if (rpeCount >= 3 && rpeCount % 3 === 0) {
+      await sendTelegram(chatId,
+        'You have logged ' + rpeCount + ' sessions. Running /setzones to recalibrate your zones with the new data...'
+      );
+      var updatedAthlete = await db.getAthleteByTelegram(chatId);
+      await runZoneCalculation(chatId, updatedAthlete);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// ZONE CALCULATION (HRmax anchored)
+// ─────────────────────────────────────────────
+async function runZoneCalculation(chatId, athlete) {
+  await sendTelegram(chatId, 'Analyzing your last 90 days of Strava runs. Give me a moment...');
+  try {
+    var zones = await calculateZonesFromStrava(athlete);
+    if (!zones) {
+      await sendTelegram(chatId, 'I need at least 5 runs with heart rate data in the last 90 days. Keep training and try again soon!');
+      return;
+    }
+    await db.updateAthlete(String(chatId), {
+      critical_speed: zones.criticalSpeed,
+      zone1_pace: zones.z1,
+      zone2_pace: zones.z2,
+      zone3_pace: zones.z3,
+      zone4_pace: zones.z4,
+      zone5_pace: zones.z5,
+      lt1_pace: zones.lt1,
+      lt2_pace: zones.lt2,
+      lt1_hr: String(zones.lt1Hr),
+      lt2_hr: String(zones.lt2Hr),
+      max_hr_actual: zones.maxHrSeen,
+      awaiting_input: null
+    });
+    await sendTelegram(chatId,
+      'Zones calculated from ' + zones.runsAnalyzed + ' runs\n\n' +
+      'Max HR used: ' + zones.maxHrUsed + ' bpm (' + zones.maxHrSource + ')\n\n' +
+      'LT1 aerobic threshold:   ' + zones.lt1 + ' min/km at ' + zones.lt1Hr + ' bpm\n' +
+      'LT2 anaerobic threshold: ' + zones.lt2 + ' min/km at ' + zones.lt2Hr + ' bpm\n\n' +
+      'Z1 Recovery:     slower than ' + zones.z1 + ' min/km\n' +
+      'Z2 Aerobic Base: ' + zones.z2 + ' min/km\n' +
+      'Z3 Tempo:        ' + zones.z3 + ' min/km\n' +
+      'Z4 Threshold:    ' + zones.z4 + ' min/km\n' +
+      'Z5 VO2max+:      faster than ' + zones.z5 + ' min/km\n\n' +
+      'These zones will auto-refine as you log RPE after each run.\n' +
+      'Use /setzones anytime to recalculate.'
+    );
+  } catch (err) {
+    console.error('Zone calculation error:', err.message);
+    await sendTelegram(chatId, 'Something went wrong analyzing your Strava data. Try again in a moment.');
+  }
+}
+
+// ─────────────────────────────────────────────
+// RPE ZONE ADJUSTMENT LOGIC
+// ─────────────────────────────────────────────
+async function adjustZonesFromRPE(athlete, rpe, activityId) {
+  // Get the activity to know what zone it was in
+  var activity = await db.getActivityByStravaId(activityId);
+  if (!activity || !athlete.lt2_pace) return null;
+
+  // Parse LT2 pace to seconds
+  var lt2Parts = athlete.lt2_pace.split(':');
+  var lt2Sec = parseInt(lt2Parts[0]) * 60 + parseInt(lt2Parts[1]);
+
+  // Get activity pace
+  if (!activity.avg_pace) return null;
+  var paceParts = activity.avg_pace.split(':');
+  var activityPaceSec = parseInt(paceParts[0]) * 60 + parseInt(paceParts[1]);
+
+  // Was this a threshold session? (within 10% of LT2 pace)
+  var isThresholdSession = Math.abs(activityPaceSec - lt2Sec) / lt2Sec < 0.10;
+  if (!isThresholdSession) return null;
+
+  // Target RPE for threshold is 7
+  // If RPE < 6 at threshold pace → zones too conservative → tighten by 3 sec/km
+  // If RPE > 8 at threshold pace → zones too aggressive → loosen by 3 sec/km
+  var adjustment = null;
+  if (rpe <= 5) {
+    adjustment = 'faster';
+    var newLt2Sec = lt2Sec - 5;
+    await db.updateAthlete(String(athlete.telegram_id), {
+      lt2_pace: formatSecondsToMinKm(newLt2Sec),
+      critical_speed: formatSecondsToMinKm(newLt2Sec)
+    });
+  } else if (rpe >= 9) {
+    adjustment = 'slower';
+    var newLt2SecSlow = lt2Sec + 5;
+    await db.updateAthlete(String(athlete.telegram_id), {
+      lt2_pace: formatSecondsToMinKm(newLt2SecSlow),
+      critical_speed: formatSecondsToMinKm(newLt2SecSlow)
+    });
+  }
+  return adjustment;
+}
+
+function getRPEFeedback(rpe, adjustment) {
+  if (rpe <= 3) return 'Very easy effort. Good recovery session. Aerobic base work confirmed.';
+  if (rpe <= 5) return 'Moderate effort. Solid aerobic work. Good zone 2 session.';
+  if (rpe === 6) return 'Solid effort. Right at the aerobic-tempo border.';
+  if (rpe === 7) {
+    if (adjustment === 'faster') return 'Target RPE for threshold work. Your zones have been tightened slightly - you are fitter than estimated.';
+    return 'Perfect threshold effort. Right where we want you for LT2 work.';
+  }
+  if (rpe === 8) return 'Hard session. Good VO2max stimulus. Make sure tomorrow is easy recovery.';
+  if (rpe >= 9) {
+    if (adjustment === 'slower') return 'Very hard. Zones adjusted slightly - this pace may be above your current threshold. Rest well.';
+    return 'Maximum effort. Ensure 48 hours easy recovery before next hard session.';
+  }
+  return 'RPE logged.';
+}
+
+function formatSecondsToMinKm(totalSeconds) {
+  var m = Math.floor(totalSeconds / 60);
+  var s = Math.round(totalSeconds % 60).toString().padStart(2, '0');
+  return m + ':' + s;
+}
+
+// ─────────────────────────────────────────────
+// STRAVA: OAuth Step 1
+// ─────────────────────────────────────────────
 app.get('/auth/strava', (req, res) => {
-  const telegram_id = req.query.telegram_id;
-  const baseUrl = process.env.BASE_URL.startsWith('http') ? process.env.BASE_URL : 'https://' + process.env.BASE_URL;
-  const redirectUri = baseUrl + '/auth/strava/callback';
-  const params = new URLSearchParams({
+  var telegram_id = req.query.telegram_id;
+  var baseUrl = process.env.BASE_URL.startsWith('http') ? process.env.BASE_URL : 'https://' + process.env.BASE_URL;
+  var params = new URLSearchParams({
     client_id: process.env.STRAVA_CLIENT_ID,
-    redirect_uri: redirectUri,
+    redirect_uri: baseUrl + '/auth/strava/callback',
     response_type: 'code',
     approval_prompt: 'auto',
     scope: 'read,activity:read_all',
@@ -172,23 +360,26 @@ app.get('/auth/strava', (req, res) => {
   res.redirect('https://www.strava.com/oauth/authorize?' + params);
 });
 
+// ─────────────────────────────────────────────
+// STRAVA: OAuth Step 2
+// ─────────────────────────────────────────────
 app.get('/auth/strava/callback', async (req, res) => {
-  const code = req.query.code;
-  const telegramId = req.query.state;
+  var code = req.query.code;
+  var telegramId = req.query.state;
   if (!telegramId || telegramId === 'undefined' || telegramId === '') {
     return res.status(400).send('Missing telegram_id. Please use the link from the bot.');
   }
   try {
-    const tokenRes = await axios.post('https://www.strava.com/oauth/token', {
+    var tokenRes = await axios.post('https://www.strava.com/oauth/token', {
       client_id: process.env.STRAVA_CLIENT_ID,
       client_secret: process.env.STRAVA_CLIENT_SECRET,
       code: code,
       grant_type: 'authorization_code'
     });
-    const access_token = tokenRes.data.access_token;
-    const refresh_token = tokenRes.data.refresh_token;
-    const expires_at = tokenRes.data.expires_at;
-    const athlete = tokenRes.data.athlete;
+    var access_token = tokenRes.data.access_token;
+    var refresh_token = tokenRes.data.refresh_token;
+    var expires_at = tokenRes.data.expires_at;
+    var athlete = tokenRes.data.athlete;
     await db.upsertAthlete({ telegram_id: String(telegramId), name: athlete.firstname + ' ' + athlete.lastname });
     await db.updateAthlete(String(telegramId), {
       strava_id: String(athlete.id),
@@ -200,10 +391,11 @@ app.get('/auth/strava/callback', async (req, res) => {
     });
     await ensureStravaWebhook();
     await sendTelegram(telegramId,
-      'Strava connected!\n\n' +
-      'Welcome ' + athlete.firstname + '! I can now see your training data.\n\n' +
-      'Send /setzones so I can calculate your personal training zones from your actual run data.'
+      'Strava connected! Welcome ' + athlete.firstname + '!\n\n' +
+      'Now I need one more thing to calibrate your zones accurately.\n\n' +
+      'How old are you? (just type the number)'
     );
+    await db.updateAthlete(String(telegramId), { awaiting_input: 'age' });
     res.send('<h2>Connected! Return to Telegram to continue.</h2>');
   } catch (err) {
     console.error('Strava auth error:', err.message);
@@ -211,37 +403,38 @@ app.get('/auth/strava/callback', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// STRAVA: Webhook verification
+// ─────────────────────────────────────────────
 app.get('/webhook/strava', (req, res) => {
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  if (token === process.env.STRAVA_VERIFY_TOKEN) {
-    res.json({ 'hub.challenge': challenge });
+  if (req.query['hub.verify_token'] === process.env.STRAVA_VERIFY_TOKEN) {
+    res.json({ 'hub.challenge': req.query['hub.challenge'] });
   } else {
     res.sendStatus(403);
   }
 });
 
+// ─────────────────────────────────────────────
+// STRAVA: New activity webhook
+// ─────────────────────────────────────────────
 app.post('/webhook/strava', async (req, res) => {
   res.sendStatus(200);
-  const object_type = req.body.object_type;
-  const aspect_type = req.body.aspect_type;
-  const object_id = req.body.object_id;
-  const owner_id = req.body.owner_id;
-  if (object_type !== 'activity' || aspect_type !== 'create') return;
+  if (req.body.object_type !== 'activity' || req.body.aspect_type !== 'create') return;
   try {
-    const athlete = await db.getAthleteByStravaId(owner_id);
+    var athlete = await db.getAthleteByStravaId(req.body.owner_id);
     if (!athlete) return;
-    const token = await refreshStravaToken(athlete);
-    const activityRes = await axios.get(
-      'https://www.strava.com/api/v3/activities/' + object_id,
+    var token = await refreshStravaToken(athlete);
+    var activityRes = await axios.get(
+      'https://www.strava.com/api/v3/activities/' + req.body.object_id,
       { headers: { Authorization: 'Bearer ' + token } }
     );
-    const activity = activityRes.data;
-    const relevantTypes = ['Run', 'TrailRun', 'VirtualRun', 'Workout', 'WeightTraining'];
+    var activity = activityRes.data;
+    var relevantTypes = ['Run', 'TrailRun', 'VirtualRun', 'Workout', 'WeightTraining'];
     if (!relevantTypes.includes(activity.type)) return;
+
     await db.saveActivity({
       telegram_id: athlete.telegram_id,
-      strava_id: String(object_id),
+      strava_id: String(req.body.object_id),
       type: activity.type,
       name: activity.name,
       date: activity.start_date,
@@ -254,136 +447,102 @@ app.post('/webhook/strava', async (req, res) => {
       elevation_m: activity.total_elevation_gain || null,
       raw_data: JSON.stringify(activity)
     });
-    const athleteProfile = await db.getAthleteByTelegram(athlete.telegram_id);
-    const recentActivities = await db.getRecentActivities(athlete.telegram_id, 7);
-    const analysis = analyzeActivity(activity, athleteProfile);
-    const aiResponse = await anthropic.messages.create({
+
+    var athleteProfile = await db.getAthleteByTelegram(athlete.telegram_id);
+    var recentActivities = await db.getRecentActivities(athlete.telegram_id, 7);
+    var analysis = analyzeActivity(activity, athleteProfile);
+
+    var aiResponse = await anthropic.messages.create({
       model: 'claude-opus-4-6',
       max_tokens: 500,
       system: buildCoachingPrompt(buildChatContext(athleteProfile, recentActivities)),
       messages: [{ role: 'user', content: 'Analyze this activity and give concise coaching feedback:\n\n' + JSON.stringify(analysis, null, 2) }]
     });
+
+    // Send coaching feedback
     await sendTelegram(athlete.telegram_id,
-      'New ' + activity.type + ' synced: ' + activity.name + '\n\n' +
+      'New ' + activity.type + ': ' + activity.name + '\n\n' +
       aiResponse.content[0].text
     );
+
+    // Ask for RPE with tap buttons - only for runs
+    if (activity.type === 'Run' || activity.type === 'TrailRun') {
+      await sendTelegramButtons(athlete.telegram_id,
+        'How hard did that feel? Rate your RPE (1 = very easy, 10 = maximum effort):',
+        rpeButtons(String(req.body.object_id))
+      );
+    }
+
   } catch (err) {
     console.error('Strava webhook error:', err.message);
   }
 });
 
+// ─────────────────────────────────────────────
+// ZONE CALCULATION - HRmax anchored algorithm
+// ─────────────────────────────────────────────
 async function calculateZonesFromStrava(athlete) {
-  const token = await refreshStravaToken(athlete);
-  const ninetyDaysAgo = Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
-  const res = await axios.get('https://www.strava.com/api/v3/athlete/activities', {
+  var token = await refreshStravaToken(athlete);
+  var ninetyDaysAgo = Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
+
+  var res = await axios.get('https://www.strava.com/api/v3/athlete/activities', {
     headers: { Authorization: 'Bearer ' + token },
     params: { after: ninetyDaysAgo, per_page: 90 }
   });
 
-  // Filter quality runs: need HR, pace, and at least 15 min duration
-  // Exclude races (suffer score very high) to avoid skewing thresholds
-  const runs = res.data.filter(function(a) {
+  var runs = res.data.filter(function(a) {
     return (a.type === 'Run' || a.type === 'TrailRun') &&
-      a.average_heartrate && a.average_speed > 0 &&
-      a.moving_time > 900 &&
-      (!a.suffer_score || a.suffer_score < 250);
+      a.average_heartrate && a.average_speed > 0 && a.moving_time > 900;
   });
 
   if (runs.length < 5) return null;
 
-  // Build data points: pace in sec/km, HR in bpm
+  // Find actual max HR seen in data
+  var maxHrSeen = Math.max.apply(null, runs.map(function(r) {
+    return r.max_heartrate || r.average_heartrate;
+  }));
+
+  // Use Tanaka or actual - whichever is higher
+  var tanakaMax = athlete.max_hr_calculated || Math.round(208 - (0.7 * (athlete.age || 35)));
+  var maxHrUsed = Math.max(tanakaMax, maxHrSeen);
+  var maxHrSource = maxHrSeen > tanakaMax ? 'actual Strava data' : 'Tanaka formula (age ' + athlete.age + ')';
+
+  // Anchor LT1 and LT2 to HRmax percentages (research-validated)
+  // LT1 = 75-80% HRmax, LT2 = 87-92% HRmax
+  var lt1Hr = Math.round(maxHrUsed * 0.78);
+  var lt2Hr = Math.round(maxHrUsed * 0.89);
+
+  // Build data points with outlier removal
   var dataPoints = runs.map(function(r) {
     return {
       paceSecPerKm: Math.round(1000 / r.average_speed),
-      hr: Math.round(r.average_heartrate),
-      durationMin: Math.round(r.moving_time / 60)
+      hr: Math.round(r.average_heartrate)
     };
   });
 
-  // Remove outliers: drop top and bottom 10% HR values
+  // Remove top and bottom 10% HR outliers
   dataPoints.sort(function(a, b) { return a.hr - b.hr; });
   var trimCount = Math.max(1, Math.floor(dataPoints.length * 0.10));
   dataPoints = dataPoints.slice(trimCount, dataPoints.length - trimCount);
 
-  if (dataPoints.length < 5) return null;
+  if (dataPoints.length < 4) return null;
 
-  // Sort by pace slowest to fastest
-  dataPoints.sort(function(a, b) { return b.paceSecPerKm - a.paceSecPerKm; });
+  // Find pace at LT1 and LT2 HR via interpolation
+  var lt1PaceSec = interpolatePaceAtHR(dataPoints, lt1Hr);
+  var lt2PaceSec = interpolatePaceAtHR(dataPoints, lt2Hr);
 
-  // Calculate HR efficiency ratio (HR per pace unit) for each point
-  // As effort increases, HR rises disproportionately at thresholds
-  // We look for where the HR:pace slope changes - that is the threshold
-  var slopes = [];
-  for (var i = 1; i < dataPoints.length; i++) {
-    var paceDiff = dataPoints[i-1].paceSecPerKm - dataPoints[i].paceSecPerKm; // positive = getting faster
-    var hrDiff = dataPoints[i].hr - dataPoints[i-1].hr; // positive = HR going up
-    if (paceDiff > 0) {
-      slopes.push({
-        index: i,
-        pace: dataPoints[i].paceSecPerKm,
-        hr: dataPoints[i].hr,
-        slope: hrDiff / paceDiff  // HR rise per sec/km pace improvement
-      });
-    }
+  if (!lt1PaceSec || !lt2PaceSec) return null;
+
+  // Sanity check: LT2 should be faster than LT1
+  if (lt2PaceSec >= lt1PaceSec) {
+    // Swap if inverted
+    var temp = lt2PaceSec;
+    lt2PaceSec = lt1PaceSec;
+    lt1PaceSec = temp;
+    var tempHr = lt2Hr;
+    lt2Hr = lt1Hr;
+    lt1Hr = tempHr;
   }
-
-  if (slopes.length < 3) return null;
-
-  // Smooth slopes with 3-point moving average to reduce noise
-  var smoothed = [];
-  for (var j = 1; j < slopes.length - 1; j++) {
-    smoothed.push({
-      pace: slopes[j].pace,
-      hr: slopes[j].hr,
-      slope: (slopes[j-1].slope + slopes[j].slope + slopes[j+1].slope) / 3
-    });
-  }
-
-  // Find LT1: first significant slope increase (aerobic threshold)
-  // Look in lower 60% of pace range (easier efforts)
-  var avgSlope = smoothed.reduce(function(s, p) { return s + p.slope; }, 0) / smoothed.length;
-  var lt1Point = null, lt2Point = null;
-  var lt1Hr = null, lt2Hr = null;
-
-  var cutoff = Math.floor(smoothed.length * 0.60);
-  for (var k = 1; k < cutoff; k++) {
-    if (smoothed[k].slope > avgSlope * 1.3 && !lt1Point) {
-      lt1Point = smoothed[k].pace;
-      lt1Hr = smoothed[k].hr;
-      break;
-    }
-  }
-
-  // Find LT2: sharp slope increase in upper 40% (anaerobic threshold)
-  for (var l = cutoff; l < smoothed.length; l++) {
-    if (smoothed[l].slope > avgSlope * 1.8) {
-      lt2Point = smoothed[l].pace;
-      lt2Hr = smoothed[l].hr;
-      break;
-    }
-  }
-
-  // Fallback: if inflection detection fails, use robust percentile method
-  // but calibrated closer to real-world thresholds
-  var hrs = dataPoints.map(function(d) { return d.hr; });
-  var minHR = Math.min.apply(null, hrs);
-  var maxHR = Math.max.apply(null, hrs);
-  var hrRange = maxHR - minHR;
-
-  if (!lt1Point) {
-    // LT1 typically at 65-70% of HR reserve above resting
-    var lt1HrFallback = Math.round(minHR + hrRange * 0.62);
-    lt1Point = interpolatePaceAtHR(dataPoints, lt1HrFallback);
-    lt1Hr = lt1HrFallback;
-  }
-  if (!lt2Point) {
-    // LT2 typically at 82-87% of HR reserve - calibrated from research
-    var lt2HrFallback = Math.round(minHR + hrRange * 0.84);
-    lt2Point = interpolatePaceAtHR(dataPoints, lt2HrFallback);
-    lt2Hr = lt2HrFallback;
-  }
-
-  if (!lt1Point || !lt2Point) return null;
 
   function fmt(s) {
     var m = Math.floor(s / 60);
@@ -391,13 +550,15 @@ async function calculateZonesFromStrava(athlete) {
     return m + ':' + sec;
   }
 
-  // Critical Speed = LT2 pace
-  var cs = lt2Point;
+  var cs = lt2PaceSec;
 
   return {
     runsAnalyzed: runs.length,
-    lt1: fmt(lt1Point),
-    lt2: fmt(lt2Point),
+    maxHrSeen: maxHrSeen,
+    maxHrUsed: maxHrUsed,
+    maxHrSource: maxHrSource,
+    lt1: fmt(lt1PaceSec),
+    lt2: fmt(lt2PaceSec),
     lt1Hr: lt1Hr,
     lt2Hr: lt2Hr,
     criticalSpeed: fmt(cs),
@@ -425,6 +586,9 @@ function interpolatePaceAtHR(dataPoints, targetHR) {
   return null;
 }
 
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
 function formatPace(metersPerSecond) {
   if (!metersPerSecond || metersPerSecond === 0) return null;
   var secondsPerKm = 1000 / metersPerSecond;
@@ -468,6 +632,9 @@ async function ensureStravaWebhook() {
   }
 }
 
+// ─────────────────────────────────────────────
+// START SERVER
+// ─────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async function() {
   console.log('HYROX Coach Bot running on port ' + PORT);
