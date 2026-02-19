@@ -60,7 +60,7 @@ app.post('/webhook/telegram', async (req, res) => {
 
   // Handle /start command - new athlete onboarding
   if (text === '/start') {
-    await db.upsertAthlete({ telegram_id: chatId, name: firstName });
+    await db.upsertAthlete({ telegram_id: String(chatId), name: firstName });
     const stravaAuthUrl = `${process.env.BASE_URL}/auth/strava?telegram_id=${chatId}`;
     await sendTelegram(chatId,
       `Welcome ${firstName}! 👋\n\n` +
@@ -100,7 +100,7 @@ app.post('/webhook/telegram', async (req, res) => {
       `What's your best recent *5K time*? (e.g. 25:30)\n\n` +
       `Reply with just the time and I'll calculate your Critical Speed and all 5 training zones.`
     );
-    await db.updateAthlete(chatId, { awaiting_input: '5k_time' });
+    await db.updateAthlete(String(chatId), { awaiting_input: '5k_time' });
     return;
   }
 
@@ -113,7 +113,7 @@ app.post('/webhook/telegram', async (req, res) => {
       await sendTelegram(chatId, 'I didn\'t catch that. Please send your 5K time like this: *25:30*');
       return;
     }
-    await db.updateAthlete(chatId, {
+    await db.updateAthlete(String(chatId), {
       critical_speed: zones.criticalSpeed,
       five_k_time: text,
       zone1_pace: zones.z1,
@@ -181,6 +181,10 @@ app.get('/auth/strava', (req, res) => {
 // ─────────────────────────────────────────────
 app.get('/auth/strava/callback', async (req, res) => {
   const { code, state: telegramId } = req.query;
+
+  if (!telegramId || telegramId === 'undefined' || telegramId === '') {
+    return res.status(400).send('Missing telegram_id. Please start the bot again and use the connect link.');
+  }
 
   try {
     const tokenRes = await axios.post('https://www.strava.com/oauth/token', {
