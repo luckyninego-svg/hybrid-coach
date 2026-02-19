@@ -37,6 +37,10 @@ function init() {
       goal_race         TEXT,
       experience        TEXT,
       awaiting_input    TEXT,
+      lt1_pace          TEXT,
+      lt2_pace          TEXT,
+      lt1_hr            TEXT,
+      lt2_hr            TEXT,
       created_at        TEXT DEFAULT (datetime('now'))
     );
 
