@@ -390,6 +390,38 @@ app.get('/auth/strava/callback', async (req, res) => {
       name: athlete.firstname + ' ' + athlete.lastname
     });
     await ensureStravaWebhook();
+
+    // Backfill last 30 activities from Strava into Supabase
+    try {
+      var backfillRes = await axios.get('https://www.strava.com/api/v3/athlete/activities', {
+        headers: { Authorization: 'Bearer ' + access_token },
+        params: { per_page: 30 }
+      });
+      var relevantTypes = ['Run', 'TrailRun', 'VirtualRun', 'Workout', 'WeightTraining'];
+      var toSave = backfillRes.data.filter(function(a) { return relevantTypes.includes(a.type); });
+      for (var i = 0; i < toSave.length; i++) {
+        var a = toSave[i];
+        await db.saveActivity({
+          telegram_id: String(telegramId),
+          strava_id: String(a.id),
+          type: a.type,
+          name: a.name,
+          date: a.start_date,
+          distance_km: parseFloat((a.distance / 1000).toFixed(2)),
+          duration_min: Math.round(a.moving_time / 60),
+          avg_pace: formatPace(a.average_speed),
+          avg_hr: a.average_heartrate || null,
+          max_hr: a.max_heartrate || null,
+          suffer_score: a.suffer_score || null,
+          elevation_m: a.total_elevation_gain || null,
+          raw_data: JSON.stringify(a)
+        });
+      }
+      console.log('Backfilled ' + toSave.length + ' activities for ' + telegramId);
+    } catch (err) {
+      console.error('Backfill error:', err.message);
+    }
+
     await sendTelegram(telegramId,
       'Strava connected! Welcome ' + athlete.firstname + '!\n\n' +
       'Now I need one more thing to calibrate your zones accurately.\n\n' +
