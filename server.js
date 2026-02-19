@@ -196,12 +196,15 @@ app.get('/auth/strava/callback', async (req, res) => {
 
     const { access_token, refresh_token, expires_at, athlete } = tokenRes.data;
 
+    // Create athlete record first if it doesn't exist
+    await db.upsertAthlete({ telegram_id: String(telegramId), name: athlete.firstname + ' ' + athlete.lastname });
+
     await db.updateAthlete(String(telegramId), {
       strava_id: String(athlete.id),
-      strava_access_token: access_token,
-      strava_refresh_token: refresh_token,
-      strava_token_expires: expires_at,
-      strava_connected: true,
+      strava_access_token: String(access_token),
+      strava_refresh_token: String(refresh_token),
+      strava_token_expires: Number(expires_at),
+      strava_connected: 1,
       name: athlete.firstname + ' ' + athlete.lastname
     });
 
