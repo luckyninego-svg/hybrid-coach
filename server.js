@@ -43,12 +43,20 @@ app.post('/webhook/telegram', async (req, res) => {
   if (text === '/start') {
     await db.upsertAthlete({ telegram_id: String(chatId), name: firstName });
     const stravaAuthUrl = process.env.BASE_URL + '/auth/strava?telegram_id=' + chatId;
-    await sendTelegram(chatId,
-      'Welcome ' + firstName + '!\n\n' +
-      'I am your personal Running & HYROX coach, powered by science.\n\n' +
-      'Connect your Strava so I can read your training data:\n' +
-      stravaAuthUrl
-    );
+    // Use inline button so Telegram preserves the full URL including state param
+    try {
+      await axios.post(TELEGRAM_API + '/sendMessage', {
+        chat_id: chatId,
+        text: 'Welcome ' + firstName + '!\n\nI am your personal Running & HYROX coach, powered by science.\n\nTap the button below to connect your Strava:',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: 'Connect Strava', url: stravaAuthUrl }
+          ]]
+        }
+      });
+    } catch (err) {
+      console.error('Start message error:', err.message);
+    }
     return;
   }
 
