@@ -93,24 +93,69 @@ app.post('/webhook/telegram', async (req, res) => {
     return;
   }
 
-  // Handle /setzones command
+  // Handle /setzones command - uses Strava HR data to estimate LT1/LT2
   if (text.startsWith('/setzones')) {
-    await sendTelegram(chatId,
-      `Let's calculate your training zones. 📊\n\n` +
-      `What's your best recent *5K time*? (e.g. 25:30)\n\n` +
-      `Reply with just the time and I'll calculate your Critical Speed and all 5 training zones.`
-    );
-    await db.updateAthlete(String(chatId), { awaiting_input: '5k_time' });
+    const athleteForZones = await db.getAthleteByTelegram(chatId);
+    if (!athleteForZones || !athleteForZones.strava_connected) {
+      await sendTelegram(chatId, 'Please connect Strava first so I can analyze your actual training data to find your thresholds.');
+      return;
+    }
+    await sendTelegram(chatId, 'Analyzing your last 60 days of Strava runs to estimate your LT1, LT2 and training zones. Give me a moment...');
+    try {
+      const zones = await calculateZonesFromStrava(athleteForZones);
+      if (!zones) {
+        await sendTelegram(chatId, 'I need at least 10 runs with heart rate data in the last 60 days to calculate your zones. Keep training and try again soon!');
+        return;
+      }
+      await db.updateAthlete(String(chatId), {
+        critical_speed: zones.criticalSpeed,
+        zone1_pace: zones.z1,
+        zone2_pace: zones.z2,
+        zone3_pace: zones.z3,
+        zone4_pace: zones.z4,
+        zone5_pace: zones.z5,
+        lt1_pace: zones.lt1,
+        lt2_pace: zones.lt2,
+        lt1_hr: String(zones.lt1Hr),
+        lt2_hr: String(zones.lt2Hr),
+        awaiting_input: null
+      });
+      await sendTelegram(chatId,
+        'Zones calculated from your Strava data (' + zones.runsAnalyzed + ' runs analyzed):
+
+' +
+        'LT1 aerobic threshold: ' + zones.lt1 + ' min/km at ' + zones.lt1Hr + ' bpm
+' +
+        'LT2 anaerobic threshold: ' + zones.lt2 + ' min/km at ' + zones.lt2Hr + ' bpm
+
+' +
+        'Z1 Recovery:     slower than ' + zones.z1 + ' min/km
+' +
+        'Z2 Aerobic Base: ' + zones.z2 + ' min/km
+' +
+        'Z3 Tempo:        ' + zones.z3 + ' min/km
+' +
+        'Z4 Threshold:    ' + zones.z4 + ' min/km
+' +
+        'Z5 VO2max+:      faster than ' + zones.z5 + ' min/km
+
+' +
+        'These are based on your real training data and will be updated every 30 days.'
+      );
+    } catch (err) {
+      console.error('Zone calculation error:', err.message);
+      await sendTelegram(chatId, 'Something went wrong analyzing your Strava data. Try again in a moment.');
+    }
     return;
   }
 
   // Handle athlete input flows
   const athlete = await db.getAthleteByTelegram(chatId);
 
-  if (athlete?.awaiting_input === '5k_time') {
+  if (athlete && athlete.awaiting_input === '5k_time') {
     const zones = calculate5KZones(text);
     if (!zones) {
-      await sendTelegram(chatId, 'I didn\'t catch that. Please send your 5K time like this: *25:30*');
+      await sendTelegram(chatId, 'I did not catch that. Please send your 5K time like this: 25:30');
       return;
     }
     await db.updateAthlete(String(chatId), {
@@ -124,14 +169,24 @@ app.post('/webhook/telegram', async (req, res) => {
       awaiting_input: null
     });
     await sendTelegram(chatId,
-      `✅ *Zones calculated from ${text} 5K*\n\n` +
-      `*Critical Speed:* ${zones.criticalSpeed} min/km\n\n` +
-      `🟦 Z1 Recovery: > ${zones.z1} min/km\n` +
-      `🟩 Z2 Aerobic Base: ${zones.z2} min/km\n` +
-      `🟨 Z3 Tempo: ${zones.z3} min/km\n` +
-      `🟧 Z4 Threshold: ${zones.z4} min/km\n` +
-      `🟥 Z5 VO2max+: < ${zones.z5} min/km\n\n` +
-      `These zones are now locked in. Every activity you log will be analyzed against them. 💪`
+      'Zones calculated from ' + text + ' 5K
+
+' +
+      'Critical Speed: ' + zones.criticalSpeed + ' min/km
+
+' +
+      'Z1 Recovery: > ' + zones.z1 + '
+' +
+      'Z2 Aerobic Base: ' + zones.z2 + '
+' +
+      'Z3 Tempo: ' + zones.z3 + '
+' +
+      'Z4 Threshold: ' + zones.z4 + '
+' +
+      'Z5 VO2max+: < ' + zones.z5 + '
+
+' +
+      'These zones are now locked in.'
     );
     return;
   }
@@ -392,6 +447,106 @@ async function ensureStravaWebhook() {
   } catch (err) {
     console.error('Webhook registration error:', err.message);
   }
+}
+
+
+// ─────────────────────────────────────────────
+// CALCULATE LT1 / LT2 FROM STRAVA HISTORY
+// Uses pace vs HR relationship across last 60 days
+// ─────────────────────────────────────────────
+async function calculateZonesFromStrava(athlete) {
+  const token = await refreshStravaToken(athlete);
+  const sixtyDaysAgo = Math.floor((Date.now() - 60 * 24 * 60 * 60 * 1000) / 1000);
+
+  // Fetch last 60 days of activities
+  const res = await axios.get('https://www.strava.com/api/v3/athlete/activities', {
+    headers: { Authorization: 'Bearer ' + token },
+    params: { after: sixtyDaysAgo, per_page: 60 }
+  });
+
+  // Filter runs with HR and pace data
+  const runs = res.data.filter(a =>
+    (a.type === 'Run' || a.type === 'TrailRun') &&
+    a.average_heartrate &&
+    a.average_speed > 0 &&
+    a.moving_time > 600  // at least 10 minutes
+  );
+
+  if (runs.length < 5) return null;
+
+  // Build pace/HR data points
+  // pace in sec/km, hr in bpm
+  const dataPoints = runs.map(r => ({
+    paceSecPerKm: Math.round(1000 / r.average_speed),
+    hr: Math.round(r.average_heartrate),
+    durationMin: Math.round(r.moving_time / 60),
+    sufferScore: r.suffer_score || 0
+  }));
+
+  // Sort by pace (slowest to fastest)
+  dataPoints.sort((a, b) => b.paceSecPerKm - a.paceSecPerKm);
+
+  // Find HR range
+  const hrs = dataPoints.map(d => d.hr);
+  const minHR = Math.min(...hrs);
+  const maxHR = Math.max(...hrs);
+  const hrRange = maxHR - minHR;
+
+  // LT1 estimate: HR at ~55% of HR range above min (aerobic threshold)
+  const lt1Hr = Math.round(minHR + hrRange * 0.55);
+  // LT2 estimate: HR at ~80% of HR range above min (anaerobic threshold)  
+  const lt2Hr = Math.round(minHR + hrRange * 0.80);
+
+  // Find paces corresponding to these HR values
+  // Use linear interpolation across data points
+  const lt1Point = interpolatePaceAtHR(dataPoints, lt1Hr);
+  const lt2Point = interpolatePaceAtHR(dataPoints, lt2Hr);
+
+  if (!lt1Point || !lt2Point) return null;
+
+  const fmt = (s) => {
+    const m = Math.floor(s / 60);
+    const sec = Math.round(s % 60).toString().padStart(2, '0');
+    return m + ':' + sec;
+  };
+
+  // Critical Speed = LT2 pace
+  const cs = lt2Point;
+
+  return {
+    runsAnalyzed: runs.length,
+    lt1: fmt(lt1Point),
+    lt2: fmt(lt2Point),
+    lt1Hr,
+    lt2Hr,
+    criticalSpeed: fmt(cs),
+    z1: fmt(cs * 1.35),
+    z2: fmt(cs * 1.20) + '-' + fmt(cs * 1.35),
+    z3: fmt(cs * 1.08) + '-' + fmt(cs * 1.20),
+    z4: fmt(cs * 0.97) + '-' + fmt(cs * 1.08),
+    z5: fmt(cs * 0.97)
+  };
+}
+
+function interpolatePaceAtHR(dataPoints, targetHR) {
+  // Find two closest points around target HR
+  let below = null, above = null;
+  for (const p of dataPoints) {
+    if (p.hr <= targetHR) {
+      if (!below || p.hr > below.hr) below = p;
+    }
+    if (p.hr >= targetHR) {
+      if (!above || p.hr < above.hr) above = p;
+    }
+  }
+  if (below && above && below !== above) {
+    // Linear interpolation
+    const ratio = (targetHR - below.hr) / (above.hr - below.hr);
+    return Math.round(below.paceSecPerKm + ratio * (above.paceSecPerKm - below.paceSecPerKm));
+  }
+  if (below) return below.paceSecPerKm;
+  if (above) return above.paceSecPerKm;
+  return null;
 }
 
 // ─────────────────────────────────────────────
