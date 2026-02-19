@@ -274,39 +274,132 @@ app.post('/webhook/strava', async (req, res) => {
 
 async function calculateZonesFromStrava(athlete) {
   const token = await refreshStravaToken(athlete);
-  const sixtyDaysAgo = Math.floor((Date.now() - 60 * 24 * 60 * 60 * 1000) / 1000);
+  const ninetyDaysAgo = Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
   const res = await axios.get('https://www.strava.com/api/v3/athlete/activities', {
     headers: { Authorization: 'Bearer ' + token },
-    params: { after: sixtyDaysAgo, per_page: 60 }
+    params: { after: ninetyDaysAgo, per_page: 90 }
   });
+
+  // Filter quality runs: need HR, pace, and at least 15 min duration
+  // Exclude races (suffer score very high) to avoid skewing thresholds
   const runs = res.data.filter(function(a) {
     return (a.type === 'Run' || a.type === 'TrailRun') &&
-      a.average_heartrate && a.average_speed > 0 && a.moving_time > 600;
+      a.average_heartrate && a.average_speed > 0 &&
+      a.moving_time > 900 &&
+      (!a.suffer_score || a.suffer_score < 250);
   });
+
   if (runs.length < 5) return null;
-  const dataPoints = runs.map(function(r) {
-    return { paceSecPerKm: Math.round(1000 / r.average_speed), hr: Math.round(r.average_heartrate) };
+
+  // Build data points: pace in sec/km, HR in bpm
+  var dataPoints = runs.map(function(r) {
+    return {
+      paceSecPerKm: Math.round(1000 / r.average_speed),
+      hr: Math.round(r.average_heartrate),
+      durationMin: Math.round(r.moving_time / 60)
+    };
   });
+
+  // Remove outliers: drop top and bottom 10% HR values
+  dataPoints.sort(function(a, b) { return a.hr - b.hr; });
+  var trimCount = Math.max(1, Math.floor(dataPoints.length * 0.10));
+  dataPoints = dataPoints.slice(trimCount, dataPoints.length - trimCount);
+
+  if (dataPoints.length < 5) return null;
+
+  // Sort by pace slowest to fastest
   dataPoints.sort(function(a, b) { return b.paceSecPerKm - a.paceSecPerKm; });
-  const hrs = dataPoints.map(function(d) { return d.hr; });
-  const minHR = Math.min.apply(null, hrs);
-  const maxHR = Math.max.apply(null, hrs);
-  const hrRange = maxHR - minHR;
-  const lt1Hr = Math.round(minHR + hrRange * 0.55);
-  const lt2Hr = Math.round(minHR + hrRange * 0.80);
-  const lt1Point = interpolatePaceAtHR(dataPoints, lt1Hr);
-  const lt2Point = interpolatePaceAtHR(dataPoints, lt2Hr);
+
+  // Calculate HR efficiency ratio (HR per pace unit) for each point
+  // As effort increases, HR rises disproportionately at thresholds
+  // We look for where the HR:pace slope changes - that is the threshold
+  var slopes = [];
+  for (var i = 1; i < dataPoints.length; i++) {
+    var paceDiff = dataPoints[i-1].paceSecPerKm - dataPoints[i].paceSecPerKm; // positive = getting faster
+    var hrDiff = dataPoints[i].hr - dataPoints[i-1].hr; // positive = HR going up
+    if (paceDiff > 0) {
+      slopes.push({
+        index: i,
+        pace: dataPoints[i].paceSecPerKm,
+        hr: dataPoints[i].hr,
+        slope: hrDiff / paceDiff  // HR rise per sec/km pace improvement
+      });
+    }
+  }
+
+  if (slopes.length < 3) return null;
+
+  // Smooth slopes with 3-point moving average to reduce noise
+  var smoothed = [];
+  for (var j = 1; j < slopes.length - 1; j++) {
+    smoothed.push({
+      pace: slopes[j].pace,
+      hr: slopes[j].hr,
+      slope: (slopes[j-1].slope + slopes[j].slope + slopes[j+1].slope) / 3
+    });
+  }
+
+  // Find LT1: first significant slope increase (aerobic threshold)
+  // Look in lower 60% of pace range (easier efforts)
+  var avgSlope = smoothed.reduce(function(s, p) { return s + p.slope; }, 0) / smoothed.length;
+  var lt1Point = null, lt2Point = null;
+  var lt1Hr = null, lt2Hr = null;
+
+  var cutoff = Math.floor(smoothed.length * 0.60);
+  for (var k = 1; k < cutoff; k++) {
+    if (smoothed[k].slope > avgSlope * 1.3 && !lt1Point) {
+      lt1Point = smoothed[k].pace;
+      lt1Hr = smoothed[k].hr;
+      break;
+    }
+  }
+
+  // Find LT2: sharp slope increase in upper 40% (anaerobic threshold)
+  for (var l = cutoff; l < smoothed.length; l++) {
+    if (smoothed[l].slope > avgSlope * 1.8) {
+      lt2Point = smoothed[l].pace;
+      lt2Hr = smoothed[l].hr;
+      break;
+    }
+  }
+
+  // Fallback: if inflection detection fails, use robust percentile method
+  // but calibrated closer to real-world thresholds
+  var hrs = dataPoints.map(function(d) { return d.hr; });
+  var minHR = Math.min.apply(null, hrs);
+  var maxHR = Math.max.apply(null, hrs);
+  var hrRange = maxHR - minHR;
+
+  if (!lt1Point) {
+    // LT1 typically at 65-70% of HR reserve above resting
+    var lt1HrFallback = Math.round(minHR + hrRange * 0.62);
+    lt1Point = interpolatePaceAtHR(dataPoints, lt1HrFallback);
+    lt1Hr = lt1HrFallback;
+  }
+  if (!lt2Point) {
+    // LT2 typically at 82-87% of HR reserve - calibrated from research
+    var lt2HrFallback = Math.round(minHR + hrRange * 0.84);
+    lt2Point = interpolatePaceAtHR(dataPoints, lt2HrFallback);
+    lt2Hr = lt2HrFallback;
+  }
+
   if (!lt1Point || !lt2Point) return null;
+
   function fmt(s) {
     var m = Math.floor(s / 60);
     var sec = Math.round(s % 60).toString().padStart(2, '0');
     return m + ':' + sec;
   }
+
+  // Critical Speed = LT2 pace
   var cs = lt2Point;
+
   return {
     runsAnalyzed: runs.length,
-    lt1: fmt(lt1Point), lt2: fmt(lt2Point),
-    lt1Hr: lt1Hr, lt2Hr: lt2Hr,
+    lt1: fmt(lt1Point),
+    lt2: fmt(lt2Point),
+    lt1Hr: lt1Hr,
+    lt2Hr: lt2Hr,
     criticalSpeed: fmt(cs),
     z1: fmt(Math.round(cs * 1.35)),
     z2: fmt(Math.round(cs * 1.20)) + '-' + fmt(Math.round(cs * 1.35)),
