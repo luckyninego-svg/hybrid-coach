@@ -192,8 +192,8 @@ app.get('/auth/strava/callback', async (req, res) => {
 
     const { access_token, refresh_token, expires_at, athlete } = tokenRes.data;
 
-    await db.updateAthlete(telegramId, {
-      strava_id: athlete.id,
+    await db.updateAthlete(String(telegramId), {
+      strava_id: String(athlete.id),
       strava_access_token: access_token,
       strava_refresh_token: refresh_token,
       strava_token_expires: expires_at,
