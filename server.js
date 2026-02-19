@@ -31,13 +31,15 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 // ─────────────────────────────────────────────
 async function sendTelegram(chatId, text) {
   try {
+    // Strip markdown symbols to avoid parse errors
+    const cleanText = text.replace(/[*_`]/g, '');
     await axios.post(`${TELEGRAM_API}/sendMessage`, {
       chat_id: chatId,
-      text,
-      parse_mode: 'Markdown'
+      text: cleanText
     });
   } catch (err) {
     console.error('Telegram send error:', err.message);
+    console.error('Telegram error details:', err.response?.data);
   }
 }
 
