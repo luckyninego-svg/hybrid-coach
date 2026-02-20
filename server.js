@@ -109,6 +109,7 @@ app.post('/webhook/telegram', async (req, res) => {
       'Zone calibration: ' + (athlete.rpe_count ? athlete.rpe_count + ' sessions logged' : 'Not started') + '\n' +
       'Training Phase: ' + (athlete.training_phase || 'Base') + '\n\n' +
       '/setzones - calculate zones from Strava data\n' +
+      '/sync - manually sync latest activities from Strava\n' +
       '/disconnect - disconnect Strava'
     );
     return;
@@ -127,6 +128,50 @@ app.post('/webhook/telegram', async (req, res) => {
       'Your training history is still saved.\n' +
       'Send /start anytime to reconnect.'
     );
+    return;
+  }
+
+  // /sync - manually backfill latest 30 activities from Strava
+  if (text === '/sync') {
+    const syncAthlete = await db.getAthleteByTelegram(chatId);
+    if (!syncAthlete || !syncAthlete.strava_connected) {
+      await sendTelegram(chatId, 'Please connect Strava first. Send /start to get the connect link.');
+      return;
+    }
+    await sendTelegram(chatId, 'Syncing your latest activities from Strava...');
+    try {
+      var syncToken = await refreshStravaToken(syncAthlete);
+      var syncRes = await axios.get('https://www.strava.com/api/v3/athlete/activities', {
+        headers: { Authorization: 'Bearer ' + syncToken },
+        params: { per_page: 30 }
+      });
+      var saved = 0;
+      for (var si = 0; si < syncRes.data.length; si++) {
+        var sa = syncRes.data[si];
+        try {
+          await db.saveActivity({
+            telegram_id: String(chatId),
+            strava_id: String(sa.id),
+            type: sa.type,
+            name: sa.name,
+            date: sa.start_date,
+            distance_km: parseFloat((sa.distance / 1000).toFixed(2)),
+            duration_min: Math.round(sa.moving_time / 60),
+            avg_pace: formatPace(sa.average_speed),
+            avg_hr: sa.average_heartrate || null,
+            max_hr: sa.max_heartrate || null,
+            suffer_score: sa.suffer_score || null,
+            elevation_m: sa.total_elevation_gain || null,
+            raw_data: JSON.stringify(sa)
+          });
+          saved++;
+        } catch (e) { /* skip duplicates */ }
+      }
+      await sendTelegram(chatId, 'Synced ' + saved + ' activities from Strava. You can now ask me about any of them.');
+    } catch (err) {
+      console.error('Sync error:', err.message);
+      await sendTelegram(chatId, 'Something went wrong syncing. Try again in a moment.');
+    }
     return;
   }
 
@@ -397,8 +442,8 @@ app.get('/auth/strava/callback', async (req, res) => {
         headers: { Authorization: 'Bearer ' + access_token },
         params: { per_page: 30 }
       });
-      var relevantTypes = ['Run', 'TrailRun', 'VirtualRun', 'Workout', 'WeightTraining'];
-      var toSave = backfillRes.data.filter(function(a) { return relevantTypes.includes(a.type); });
+      // Accept all activity types
+      var toSave = backfillRes.data;
       for (var i = 0; i < toSave.length; i++) {
         var a = toSave[i];
         await db.saveActivity({
@@ -461,8 +506,7 @@ app.post('/webhook/strava', async (req, res) => {
       { headers: { Authorization: 'Bearer ' + token } }
     );
     var activity = activityRes.data;
-    var relevantTypes = ['Run', 'TrailRun', 'VirtualRun', 'Workout', 'WeightTraining'];
-    if (!relevantTypes.includes(activity.type)) return;
+    // Accept all activity types - let Claude decide what's coaching-relevant
 
     await db.saveActivity({
       telegram_id: athlete.telegram_id,
