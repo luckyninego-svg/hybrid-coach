@@ -180,7 +180,7 @@ app.post('/webhook/telegram', async (req, res) => {
     const context = buildChatContext(athleteData, recentActivities);
     const response = await anthropic.messages.create({
       model: 'claude-opus-4-6',
-      max_tokens: 600,
+      max_tokens: 800,
       system: buildCoachingPrompt(context),
       messages: [{ role: 'user', content: text }]
     });
@@ -486,7 +486,7 @@ app.post('/webhook/strava', async (req, res) => {
 
     var aiResponse = await anthropic.messages.create({
       model: 'claude-opus-4-6',
-      max_tokens: 500,
+      max_tokens: 700,
       system: buildCoachingPrompt(buildChatContext(athleteProfile, recentActivities)),
       messages: [{ role: 'user', content: 'Analyze this activity and give concise coaching feedback:\n\n' + JSON.stringify(analysis, null, 2) }]
     });
