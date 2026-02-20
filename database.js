@@ -91,6 +91,15 @@ async function saveRPE(stravaId, rpe) {
   if (error) console.error('saveRPE error:', error.message);
 }
 
+async function getAllConnectedAthletes() {
+  const { data, error } = await supabase
+    .from('athletes')
+    .select('*')
+    .eq('strava_connected', 1);
+  if (error) console.error('getAllConnectedAthletes error:', error.message);
+  return data || [];
+}
+
 module.exports = {
   init,
   upsertAthlete,
@@ -100,5 +109,6 @@ module.exports = {
   saveActivity,
   getRecentActivities,
   getActivityByStravaId,
-  saveRPE
+  saveRPE,
+  getAllConnectedAthletes
 };
