@@ -223,7 +223,56 @@ function analyzeActivity(activity, athlete) {
       lt1_pace: athlete && athlete.lt1_pace ? athlete.lt1_pace : null,
       lt2_pace: athlete && athlete.lt2_pace ? athlete.lt2_pace : null
     },
-    instructions: 'Analyze this session against the athlete zones. Identify what went well and what to adjust. Then prescribe the next specific workout using the prescription format. State your hypothesis for what should happen in the next session.'
+    splits: activity._splits && activity._splits.length > 0 ? {
+      per_km: activity._splits,
+      analysis: analyzeSplits(activity._splits, athlete)
+    } : null,
+    instructions: 'Analyze this session against the athlete zones. If km splits are available, comment specifically on: pacing discipline (did pace vary too much?), cardiac drift (did HR rise while pace stayed the same?), and fade (did pace drop in the second half?). Then prescribe the next specific workout. State your hypothesis.'
+  };
+}
+
+function analyzeSplits(splits, athlete) {
+  if (!splits || splits.length < 2) return null;
+
+  var paces = splits.map(function(s) { return s.pace; }).filter(Boolean);
+  var hrs = splits.map(function(s) { return s.hr; }).filter(Boolean);
+
+  // Cardiac drift: compare avg HR first half vs second half
+  var midpoint = Math.floor(splits.length / 2);
+  var firstHalfHR = splits.slice(0, midpoint).filter(function(s) { return s.hr; });
+  var secondHalfHR = splits.slice(midpoint).filter(function(s) { return s.hr; });
+
+  var avgHR1 = firstHalfHR.length > 0 ? Math.round(firstHalfHR.reduce(function(s,x) { return s + x.hr; }, 0) / firstHalfHR.length) : null;
+  var avgHR2 = secondHalfHR.length > 0 ? Math.round(secondHalfHR.reduce(function(s,x) { return s + x.hr; }, 0) / secondHalfHR.length) : null;
+  var cardiacDrift = avgHR1 && avgHR2 ? avgHR2 - avgHR1 : null;
+
+  // Pace fade: compare first half vs second half pace
+  function paceToSec(p) {
+    if (!p) return null;
+    var parts = p.split(':');
+    return parseInt(parts[0]) * 60 + parseInt(parts[1]);
+  }
+  var firstHalfPace = splits.slice(0, midpoint).map(function(s) { return paceToSec(s.pace); }).filter(Boolean);
+  var secondHalfPace = splits.slice(midpoint).map(function(s) { return paceToSec(s.pace); }).filter(Boolean);
+
+  var avgPace1 = firstHalfPace.length > 0 ? Math.round(firstHalfPace.reduce(function(a,b) { return a+b; }, 0) / firstHalfPace.length) : null;
+  var avgPace2 = secondHalfPace.length > 0 ? Math.round(secondHalfPace.reduce(function(a,b) { return a+b; }, 0) / secondHalfPace.length) : null;
+  var paceFade = avgPace1 && avgPace2 ? avgPace2 - avgPace1 : null; // positive = got slower
+
+  return {
+    cardiac_drift_bpm: cardiacDrift,
+    cardiac_drift_assessment: cardiacDrift !== null
+      ? cardiacDrift > 8 ? 'HIGH drift (' + cardiacDrift + 'bpm) — possible fatigue, heat, or insufficient aerobic base'
+        : cardiacDrift > 4 ? 'MODERATE drift (' + cardiacDrift + 'bpm) — normal for longer efforts'
+        : 'LOW drift (' + cardiacDrift + 'bpm) — good aerobic efficiency'
+      : null,
+    pace_fade_sec: paceFade,
+    pace_fade_assessment: paceFade !== null
+      ? paceFade > 15 ? 'SIGNIFICANT fade (' + paceFade + 's/km) — went out too fast or glycogen depleted'
+        : paceFade > 8 ? 'MODERATE fade (' + paceFade + 's/km) — pacing could be more even'
+        : paceFade < -5 ? 'NEGATIVE SPLIT (' + Math.abs(paceFade) + 's/km faster) — excellent pacing discipline'
+        : 'EVEN pacing — good control'
+      : null
   };
 }
 
