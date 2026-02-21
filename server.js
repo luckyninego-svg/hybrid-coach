@@ -496,16 +496,48 @@ app.get('/webhook/strava', (req, res) => {
 // ─────────────────────────────────────────────
 app.post('/webhook/strava', async (req, res) => {
   res.sendStatus(200);
-  if (req.body.object_type !== 'activity' || req.body.aspect_type !== 'create') return;
+  console.log('Strava webhook received:', JSON.stringify(req.body));
+  if (req.body.object_type !== 'activity' || req.body.aspect_type !== 'create') {
+    console.log('Ignoring webhook - not a new activity:', req.body.object_type, req.body.aspect_type);
+    return;
+  }
   try {
+    console.log('Looking up athlete with Strava ID:', req.body.owner_id);
     var athlete = await db.getAthleteByStravaId(req.body.owner_id);
-    if (!athlete) return;
+    if (!athlete) {
+      console.log('No athlete found for Strava ID:', req.body.owner_id);
+      return;
+    }
+    console.log('Found athlete:', athlete.telegram_id, athlete.name);
     var token = await refreshStravaToken(athlete);
     var activityRes = await axios.get(
       'https://www.strava.com/api/v3/activities/' + req.body.object_id,
       { headers: { Authorization: 'Bearer ' + token } }
     );
     var activity = activityRes.data;
+
+    // Fetch per-km splits for runs
+    var splits = [];
+    if (activity.type === 'Run' || activity.type === 'TrailRun') {
+      try {
+        // Use the splits_metric already in the activity detail (per km auto-splits)
+        if (activity.splits_metric && activity.splits_metric.length > 0) {
+          splits = activity.splits_metric.map(function(s, idx) {
+            var paceSec = s.average_speed > 0 ? Math.round(1000 / s.average_speed) : null;
+            return {
+              km: idx + 1,
+              pace: paceSec ? Math.floor(paceSec/60) + ':' + (paceSec%60).toString().padStart(2,'0') : null,
+              hr: s.average_heartrate ? Math.round(s.average_heartrate) : null,
+              elevation: s.elevation_difference ? Math.round(s.elevation_difference) : null
+            };
+          });
+        }
+      } catch (splitErr) {
+        console.error('Splits fetch error:', splitErr.message);
+      }
+    }
+    // Attach splits to activity for AI analysis
+    activity._splits = splits;
     // Accept all activity types - let Claude decide what's coaching-relevant
 
     await db.saveActivity({
@@ -709,6 +741,110 @@ async function ensureStravaWebhook() {
 }
 
 // ─────────────────────────────────────────────
+// AUTO-SYNC: Poll Strava every 30 minutes for all athletes
+// Backup mechanism in case webhook misses activities
+// ─────────────────────────────────────────────
+async function autoSyncAllAthletes() {
+  console.log('Auto-sync started:', new Date().toISOString());
+  try {
+    var athletes = await db.getAllConnectedAthletes();
+    console.log('Auto-sync: found ' + athletes.length + ' connected athletes');
+    for (var i = 0; i < athletes.length; i++) {
+      var athlete = athletes[i];
+      try {
+        var token = await refreshStravaToken(athlete);
+        // Only fetch activities from last 24 hours
+        var since = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000);
+        var res = await axios.get('https://www.strava.com/api/v3/athlete/activities', {
+          headers: { Authorization: 'Bearer ' + token },
+          params: { after: since, per_page: 10 }
+        });
+        var newActivities = 0;
+        for (var j = 0; j < res.data.length; j++) {
+          var a = res.data[j];
+          // Check if already saved
+          var existing = await db.getActivityByStravaId(String(a.id));
+          if (existing) continue;
+
+          // Fetch full activity detail to get splits_metric
+          var fullActivity = a;
+          if (a.type === 'Run' || a.type === 'TrailRun') {
+            try {
+              var detailRes = await axios.get('https://www.strava.com/api/v3/activities/' + a.id, {
+                headers: { Authorization: 'Bearer ' + syncToken }
+              });
+              fullActivity = detailRes.data;
+              if (fullActivity.splits_metric && fullActivity.splits_metric.length > 0) {
+                fullActivity._splits = fullActivity.splits_metric.map(function(s, idx) {
+                  var paceSec = s.average_speed > 0 ? Math.round(1000 / s.average_speed) : null;
+                  return {
+                    km: idx + 1,
+                    pace: paceSec ? Math.floor(paceSec/60) + ':' + (paceSec%60).toString().padStart(2,'0') : null,
+                    hr: s.average_heartrate ? Math.round(s.average_heartrate) : null,
+                    elevation: s.elevation_difference ? Math.round(s.elevation_difference) : null
+                  };
+                });
+              }
+            } catch (e) {
+              console.error('Detail fetch error:', e.message);
+            }
+          }
+          a = fullActivity;
+
+          // Save new activity
+          await db.saveActivity({
+            telegram_id: athlete.telegram_id,
+            strava_id: String(a.id),
+            type: a.type,
+            name: a.name,
+            date: a.start_date,
+            distance_km: parseFloat((a.distance / 1000).toFixed(2)),
+            duration_min: Math.round(a.moving_time / 60),
+            avg_pace: formatPace(a.average_speed),
+            avg_hr: a.average_heartrate || null,
+            max_hr: a.max_heartrate || null,
+            suffer_score: a.suffer_score || null,
+            elevation_m: a.total_elevation_gain || null,
+            raw_data: JSON.stringify(a)
+          });
+          newActivities++;
+          // Send coaching feedback for new activity
+          try {
+            var athleteProfile = await db.getAthleteByTelegram(athlete.telegram_id);
+            var recentActivities = await db.getRecentActivities(athlete.telegram_id, 7);
+            var analysis = analyzeActivity(a, athleteProfile);
+            var aiResponse = await anthropic.messages.create({
+              model: 'claude-opus-4-6',
+              max_tokens: 700,
+              system: buildCoachingPrompt(buildChatContext(athleteProfile, recentActivities)),
+              messages: [{ role: 'user', content: 'Analyze this activity and give concise coaching feedback with next workout prescription:\n\n' + JSON.stringify(analysis, null, 2) }]
+            });
+            await sendTelegram(athlete.telegram_id,
+              'New ' + a.type + ': ' + a.name + '\n\n' + aiResponse.content[0].text
+            );
+            if (a.type === 'Run' || a.type === 'TrailRun') {
+              await sendTelegramButtons(athlete.telegram_id,
+                'How hard did that feel? (1 = very easy, 10 = maximum)',
+                rpeButtons(String(a.id))
+              );
+            }
+          } catch (feedbackErr) {
+            console.error('Auto-sync feedback error:', feedbackErr.message);
+          }
+        }
+        if (newActivities > 0) {
+          console.log('Auto-sync: saved ' + newActivities + ' new activities for ' + athlete.name);
+        }
+      } catch (athleteErr) {
+        console.error('Auto-sync error for athlete ' + athlete.telegram_id + ':', athleteErr.message);
+      }
+    }
+  } catch (err) {
+    console.error('Auto-sync failed:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -721,4 +857,8 @@ app.listen(PORT, async function() {
   } catch (err) {
     console.error('Telegram webhook error:', err.message);
   }
+  // Run auto-sync immediately on boot, then every 30 minutes
+  autoSyncAllAthletes();
+  setInterval(autoSyncAllAthletes, 30 * 60 * 1000);
+  console.log('Auto-sync scheduled every 30 minutes');
 });
